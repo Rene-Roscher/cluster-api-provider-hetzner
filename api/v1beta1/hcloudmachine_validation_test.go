@@ -222,6 +222,29 @@ func TestValidateHCloudMachineSpec(t *testing.T) {
 		ImageURLCommand: "image-url-command-foo..sh",
 	})
 	require.Equal(t, `spec.imageURLCommand: Invalid value: "image-url-command-foo..sh": must not contain '..'`, errorsToString(allErrs))
+
+	// Server recycling is valid together with imageName.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageName: "ubuntu-24.04",
+		Recycle:   &ServerRecycling{Enabled: true},
+	})
+	require.Empty(t, allErrs)
+
+	// Server recycling together with imageURL is rejected: a rebuild cannot reproduce the imageURL flow.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		Recycle:         &ServerRecycling{Enabled: true},
+	})
+	require.Equal(t, `spec.recycle.enabled: Invalid value: true: server recycling is only supported with imageName, not imageURL`, errorsToString(allErrs))
+
+	// Disabled recycling does not restrict the imageURL flow.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		Recycle:         &ServerRecycling{Enabled: false},
+	})
+	require.Empty(t, allErrs)
 }
 
 func errorsToString(allErrs field.ErrorList) string {
