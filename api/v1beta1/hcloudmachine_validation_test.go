@@ -222,6 +222,82 @@ func TestValidateHCloudMachineSpec(t *testing.T) {
 		ImageURLCommand: "image-url-command-foo..sh",
 	})
 	require.Equal(t, `spec.imageURLCommand: Invalid value: "image-url-command-foo..sh": must not contain '..'`, errorsToString(allErrs))
+
+	// Server recycling is valid together with imageName.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageName:       "ubuntu-24.04",
+		ServerRecycling: ServerRecyclingEnabled,
+	})
+	require.Empty(t, allErrs)
+
+	// Server recycling and imageURL are mutually exclusive: the rescue-system flow cannot be
+	// reproduced by a rebuild.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		ServerRecycling: ServerRecyclingEnabled,
+	})
+	require.Equal(t, `spec.serverRecycling: Invalid value: "Enabled": server recycling is only supported with imageName, not imageURL`, errorsToString(allErrs))
+
+	// Disabled recycling does not restrict the imageURL flow.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		ServerRecycling: ServerRecyclingDisabled,
+	})
+	require.Empty(t, allErrs)
+
+	// The setting of the earlier fork release is validated the same way.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageName: "ubuntu-24.04",
+		Recycle:   &LegacyServerRecycling{Enabled: true},
+	})
+	require.Empty(t, allErrs)
+
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		Recycle:         &LegacyServerRecycling{Enabled: true},
+	})
+	require.Equal(t, `spec.recycle.enabled: Invalid value: true: server recycling is only supported with imageName, not imageURL`, errorsToString(allErrs))
+
+	// When serverRecycling disables recycling, the earlier setting does not restrict the imageURL flow.
+	allErrs = validateHCloudMachineSpec(HCloudMachineSpec{
+		ImageURL:        "oci://ghcr.io/example/foo:v1",
+		ImageURLCommand: "image-url-command-foo.sh",
+		ServerRecycling: ServerRecyclingDisabled,
+		Recycle:         &LegacyServerRecycling{Enabled: true},
+	})
+	require.Empty(t, allErrs)
+}
+
+func TestHCloudMachineSpecRecyclingEnabled(t *testing.T) {
+	tests := []struct {
+		name string
+		spec HCloudMachineSpec
+		want bool
+	}{
+		{name: "unset", spec: HCloudMachineSpec{}, want: false},
+		{name: "serverRecycling Enabled", spec: HCloudMachineSpec{ServerRecycling: ServerRecyclingEnabled}, want: true},
+		{name: "serverRecycling Disabled", spec: HCloudMachineSpec{ServerRecycling: ServerRecyclingDisabled}, want: false},
+		{name: "earlier fork release, enabled", spec: HCloudMachineSpec{Recycle: &LegacyServerRecycling{Enabled: true}}, want: true},
+		{name: "earlier fork release, disabled", spec: HCloudMachineSpec{Recycle: &LegacyServerRecycling{}}, want: false},
+		{
+			name: "serverRecycling Disabled overrides the earlier setting",
+			spec: HCloudMachineSpec{ServerRecycling: ServerRecyclingDisabled, Recycle: &LegacyServerRecycling{Enabled: true}},
+			want: false,
+		},
+		{
+			name: "serverRecycling Enabled overrides the earlier setting",
+			spec: HCloudMachineSpec{ServerRecycling: ServerRecyclingEnabled, Recycle: &LegacyServerRecycling{}},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, tt.spec.RecyclingEnabled())
+		})
+	}
 }
 
 func errorsToString(allErrs field.ErrorList) string {

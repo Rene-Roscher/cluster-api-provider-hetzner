@@ -315,6 +315,22 @@ func (s *Service) handleBootStateUnset(ctx context.Context) (reconcile.Result, e
 			})
 			return reconcile.Result{}, nil
 		}
+		// A recyclable server has been claimed but not verified yet, or the claim waits for hcloud to
+		// finish preparing the server. The verification is deliberately deferred to the next reconcile so
+		// that a competing claim has time to land and be observed; this requeue is that wait. See
+		// tryClaimRecyclableServer.
+		if errors.Is(err, errRecycleClaimPending) {
+			delay := claimRequeueDelay(err)
+			s.scope.Info("recyclable server claim in progress, continuing on the next reconcile", "delay", delay)
+			return reconcile.Result{RequeueAfter: delay}, nil
+		}
+
+		// A claim failed and was given up. Retrying at once would not back off, see recycleClaimRetryDelay.
+		if errors.Is(err, errRecycleClaimFailed) {
+			s.scope.Error(err, "recyclable server claim failed, trying again later", "delay", recycleClaimRetryDelay)
+			return reconcile.Result{RequeueAfter: recycleClaimRetryDelay}, nil
+		}
+
 		if errors.Is(err, errServerCreateNotPossible) {
 			err = fmt.Errorf("createServerFromImageNameOrURL failed: %w", err)
 			s.scope.Error(err, "")
@@ -1188,7 +1204,9 @@ func (s *Service) handleBootingToRealOS(ctx context.Context) (res reconcile.Resu
 	case hcloud.ServerStatusOff:
 		return s.handleServerStatusOff(ctx, server)
 
-	case hcloud.ServerStatusStarting, hcloud.ServerStatusInitializing:
+	case hcloud.ServerStatusStarting, hcloud.ServerStatusInitializing, hcloud.ServerStatusRebuilding:
+		// ServerStatusRebuilding occurs while a recycled server is being rebuilt with the machine's
+		// image and bootstrap data; treat it like any other pre-running state and wait for the reboot.
 		v1beta1conditions.MarkFalse(hm, infrav1.ServerProvisionedCondition,
 			"BootingToRealOS", clusterv1beta1.ConditionSeverityInfo,
 			"Operating system of node is booting")
@@ -1387,6 +1405,18 @@ func (s *Service) getLiveServer(ctx context.Context) (server *hcloud.Server, res
 		return nil, reconcile.Result{}, nil
 	}
 
+	// The server was resolved by ProviderID, which says nothing about who owns it. For a recycled
+	// server that is not enough: another machine may have claimed it since. See
+	// assertRecycledServerStillOwned.
+	owned, err := s.assertRecycledServerStillOwned(ctx, server)
+	if err != nil {
+		return nil, reconcile.Result{}, err
+	}
+	if !owned {
+		// The machine is being remediated; there is nothing left to reconcile for it.
+		return nil, reconcile.Result{}, nil
+	}
+
 	return server, reconcile.Result{}, nil
 }
 
@@ -1480,8 +1510,10 @@ func (s *Service) Delete(ctx context.Context) (reconcile.Result, error) {
 		return reconcile.Result{}, nil
 	}
 
-	// control planes have to be deleted as targets of server
-	if s.scope.IsControlPlane() && s.scope.HetznerCluster.Spec.ControlPlaneLoadBalancer.Enabled {
+	// control planes have to be deleted as targets of server. A recyclable server that another machine
+	// owns by now is that machine's load balancer target, so it is left alone, see returnServerToRecycling.
+	if s.scope.IsControlPlane() && s.scope.HetznerCluster.Spec.ControlPlaneLoadBalancer.Enabled &&
+		!recycledServerOwnedByAnotherMachine(server, s.scope.Name()) {
 		for _, target := range s.scope.HetznerCluster.Status.ControlPlaneLoadBalancer.Target {
 			if target.Type == infrav1.LoadBalancerTargetTypeServer && target.ServerID == server.ID {
 				if err := s.deleteServerOfLoadBalancer(ctx, server); err != nil {
@@ -1493,6 +1525,13 @@ func (s *Service) Delete(ctx context.Context) (reconcile.Result, error) {
 	}
 
 	updateHCloudMachineStatusFromServer(s.scope.HCloudMachine, server)
+
+	// Recyclable servers are returned to the recyclable set instead of being deleted. This is gated on
+	// the server's own label, not on the machine's spec, so a recyclable server is never destroyed even if
+	// recycling has since been disabled on the machine.
+	if isRecyclableServer(server) {
+		return s.returnServerToRecycling(ctx, server)
+	}
 
 	// first shut the server down, then delete it
 	switch server.Status {
@@ -1834,6 +1873,19 @@ func (s *Service) createServer(ctx context.Context, userData []byte, image *hclo
 	// if no private network exists, there must be an IPv4 for the load balancer
 	if !s.scope.HetznerCluster.Spec.HCloudNetwork.Enabled {
 		opts.PublicNet.EnableIPv4 = true
+	}
+
+	// If server recycling is enabled, claim and rebuild an existing recyclable server instead of
+	// creating a new one. This only applies to the imageName (snapshot) flow and is best-effort: if
+	// no matching recyclable server is available, fall through to a normal create.
+	if s.recyclingEnabled() && s.scope.HCloudMachine.Spec.ImageName != "" {
+		recycled, err := s.tryClaimRecyclableServer(ctx, opts, image, userData)
+		if err != nil {
+			return hcloud.ServerCreateResult{}, err
+		}
+		if recycled != nil {
+			return hcloud.ServerCreateResult{Server: recycled, Action: &hcloud.Action{ID: actionDone}}, nil
+		}
 	}
 
 	// Create the server

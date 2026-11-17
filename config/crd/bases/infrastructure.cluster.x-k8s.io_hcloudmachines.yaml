@@ -131,6 +131,28 @@ spec:
                       enabled.
                     type: boolean
                 type: object
+              recycle:
+                description: |-
+                  Recycle is the recycling setting of the earlier fork release v1.1.7-recycling. Enabled: true has
+                  the same effect as ServerRecycling: Enabled, and ServerRecycling decides when both are set. It is
+                  kept so that HCloudMachines and HCloudMachineTemplates created with that release keep recycling.
+                  Their spec cannot be changed without rolling their MachineDeployment, because
+                  HCloudMachineTemplates are immutable. New objects should use ServerRecycling.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled turns server recycling on for this machine.
+                    type: boolean
+                type: object
+              serverRecycling:
+                description: |-
+                  ServerRecycling selects whether this machine reuses a pre-existing server instead of creating a
+                  new one. It is only supported together with ImageName (snapshot provisioning). When unset it
+                  behaves like Disabled.
+                enum:
+                - Enabled
+                - Disabled
+                type: string
               sshKeys:
                 description: SSHKeys define machine-specific SSH keys and override
                   cluster-wide SSH keys.

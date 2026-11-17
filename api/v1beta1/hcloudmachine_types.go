@@ -107,7 +107,57 @@ type HCloudMachineSpec struct {
 	// the primary IP address of the server. If both IPv4 and IPv6 are disabled, then the private network has to be enabled.
 	// +optional
 	PublicNetwork *PublicNetworkSpec `json:"publicNetwork,omitempty"`
+
+	// ServerRecycling selects whether this machine reuses a pre-existing server instead of creating a
+	// new one. It is only supported together with ImageName (snapshot provisioning). When unset it
+	// behaves like Disabled.
+	// +kubebuilder:validation:Enum=Enabled;Disabled
+	// +optional
+	ServerRecycling ServerRecyclingPolicy `json:"serverRecycling,omitempty"`
+
+	// Recycle is the recycling setting of the earlier fork release v1.1.7-recycling. Enabled: true has
+	// the same effect as ServerRecycling: Enabled, and ServerRecycling decides when both are set. It is
+	// kept so that HCloudMachines and HCloudMachineTemplates created with that release keep recycling.
+	// Their spec cannot be changed without rolling their MachineDeployment, because
+	// HCloudMachineTemplates are immutable. New objects should use ServerRecycling.
+	// +optional
+	Recycle *LegacyServerRecycling `json:"recycle,omitempty"`
 }
+
+// LegacyServerRecycling is the recycling setting of the earlier fork release, see Recycle.
+type LegacyServerRecycling struct {
+	// Enabled turns server recycling on for this machine.
+	// +optional
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// RecyclingEnabled reports whether server recycling is enabled. ServerRecycling decides when it is set;
+// otherwise the setting Recycle of the earlier fork release does.
+func (s *HCloudMachineSpec) RecyclingEnabled() bool {
+	if s.ServerRecycling != "" {
+		return s.ServerRecycling == ServerRecyclingEnabled
+	}
+	return s.Recycle != nil && s.Recycle.Enabled
+}
+
+// ServerRecyclingPolicy selects whether a machine reuses a pre-existing server.
+//
+// A server offers itself for reuse by carrying the label "caph-recycle": "true". One that is not
+// used or claimed by a machine additionally carries "caph-recycle-available": "true".
+type ServerRecyclingPolicy string
+
+const (
+	// ServerRecyclingDisabled creates a new server for the machine and deletes it again when the
+	// machine is deleted. This is the behavior when ServerRecycling is unset.
+	ServerRecyclingDisabled ServerRecyclingPolicy = "Disabled"
+
+	// ServerRecyclingEnabled claims a recyclable server that matches the machine's Type and location
+	// and rebuilds it with the machine's image and bootstrap data. On deletion the server returns to
+	// the recyclable set instead of being deleted. If no recyclable server matches, a new one is
+	// created as usual.
+	ServerRecyclingEnabled ServerRecyclingPolicy = "Enabled"
+)
 
 // HCloudMachineStatus defines the observed state of HCloudMachine.
 type HCloudMachineStatus struct {
